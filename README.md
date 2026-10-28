@@ -5,8 +5,6 @@
   <h1 style="margin: 0;">Make it a Quote</h1>
 </div>
 
----
-
 Make it a Quote形式の引用画像を、PNGで描画します
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
