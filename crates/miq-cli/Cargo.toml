@@ -1,0 +1,15 @@
+[package]
+name = "miq-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for miq-rs quote rendering"
+
+[[bin]]
+name = "miq"
+path = "src/main.rs"
+
+[dependencies]
+miq-render.workspace = true
+anyhow.workspace = true
+clap.workspace = true

@@ -1,0 +1,173 @@
+name: Release miq-api
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or SHA to build
+        required: false
+        default: main
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-miq-api-${{ github.event_name == 'workflow_dispatch' && inputs.ref || 'main' }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+          fetch-depth: 0
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: miq-api-release
+
+      - name: Fetch fonts and Twemoji
+        run: ./scripts/fetch-assets.sh
+
+      - name: Test
+        run: cargo test --workspace --exclude miq-cli
+
+      - name: Release build miq-api
+        run: cargo build --release -p miq-api
+
+      - name: Package tarball
+        id: pkg
+        run: |
+          set -euo pipefail
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            SOURCE_REF="${{ inputs.ref }}"
+          else
+            SOURCE_REF="main"
+          fi
+          # Sanitize ref for tag names (branch paths, etc.)
+          SAFE_REF="$(printf '%s' "$SOURCE_REF" | tr '/:_ ' '----' | tr -cd 'A-Za-z0-9._-' | cut -c1-80)"
+          [[ -n "$SAFE_REF" ]] || SAFE_REF="unknown"
+
+          IS_PRERELEASE=false
+          TAG="build-${SHORT_SHA}"
+          TITLE="miq-api ${SHORT_SHA}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "$SOURCE_REF" != "main" ]]; then
+            IS_PRERELEASE=true
+            TAG="test-${SAFE_REF}-${SHORT_SHA}"
+            TITLE="miq-api test ${SOURCE_REF} (${SHORT_SHA})"
+          fi
+
+          STAGE="$(mktemp -d)"
+          mkdir -p "$STAGE/assets"
+          install -m 0755 target/release/miq-api "$STAGE/miq-api"
+          cp -a assets/. "$STAGE/assets/"
+          {
+            echo "SOURCE_SHA=${SOURCE_SHA}"
+            echo "SOURCE_REF=${SOURCE_REF}"
+            echo "RELEASE_TAG=${TAG}"
+            echo "BUILT_AT_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "RUNNER_OS=$(uname -s)"
+            echo "RUNNER_ARCH=$(uname -m)"
+          } > "$STAGE/BUILD_INFO"
+
+          TARBALL="miq-api-linux-x86_64.tar.gz"
+          tar -C "$STAGE" -czf "$TARBALL" miq-api assets BUILD_INFO
+          # Format accepted by sha256sum -c
+          sha256sum "$TARBALL" > "${TARBALL}.sha256"
+
+          {
+            echo "source_sha=${SOURCE_SHA}"
+            echo "short_sha=${SHORT_SHA}"
+            echo "source_ref=${SOURCE_REF}"
+            echo "tag=${TAG}"
+            echo "title=${TITLE}"
+            echo "is_prerelease=${IS_PRERELEASE}"
+            echo "tarball=${TARBALL}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "packaged ${TARBALL} tag=${TAG} prerelease=${IS_PRERELEASE}"
+          ls -lh "$TARBALL" "${TARBALL}.sha256"
+
+      - name: Publish GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.pkg.outputs.tag }}
+          TITLE: ${{ steps.pkg.outputs.title }}
+          IS_PRERELEASE: ${{ steps.pkg.outputs.is_prerelease }}
+          SOURCE_SHA: ${{ steps.pkg.outputs.source_sha }}
+          SOURCE_REF: ${{ steps.pkg.outputs.source_ref }}
+          TARBALL: ${{ steps.pkg.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          NOTES="$(printf 'Automated build of miq-api.\n\n- ref: %s\n- sha: %s\n- runner: ubuntu-24.04\n' "$SOURCE_REF" "$SOURCE_SHA")"
+          PRE_ARGS=()
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            PRE_ARGS+=(--prerelease)
+          else
+            PRE_ARGS+=(--latest=true)
+          fi
+
+          # Recreate tag/release if the same tag already exists (rebuild).
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes --cleanup-tag || true
+          fi
+          git tag -f "$TAG" "$SOURCE_SHA"
+          git push -f origin "refs/tags/${TAG}"
+
+          gh release create "$TAG" \
+            --title "$TITLE" \
+            --notes "$NOTES" \
+            --target "$SOURCE_SHA" \
+            "${PRE_ARGS[@]}" \
+            "$TARBALL" \
+            "${TARBALL}.sha256"
+
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            # Rolling prerelease pointer for CT CHANNEL=test-latest
+            ROLLING=test-latest
+            if gh release view "$ROLLING" >/dev/null 2>&1; then
+              gh release delete "$ROLLING" --yes --cleanup-tag || true
+            fi
+            git tag -f "$ROLLING" "$SOURCE_SHA"
+            git push -f origin "refs/tags/${ROLLING}"
+            gh release create "$ROLLING" \
+              --title "miq-api test-latest (${SOURCE_REF} ${SOURCE_SHA})" \
+              --notes "$NOTES" \
+              --target "$SOURCE_SHA" \
+              --prerelease \
+              --latest=false \
+              "$TARBALL" \
+              "${TARBALL}.sha256"
+          fi
+
+      - name: Prune old build-* releases
+        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.ref == 'main') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Keep the newest 10 build-* releases; delete older ones.
+          mapfile -t TAGS < <(
+            gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq '[.[] | select(.tag_name | startswith("build-"))] | sort_by(.created_at) | reverse | .[].tag_name'
+          )
+          if ((${#TAGS[@]} <= 10)); then
+            echo "nothing to prune (${#TAGS[@]} build-* releases)"
+            exit 0
+          fi
+          for tag in "${TAGS[@]:10}"; do
+            echo "deleting old release ${tag}"
+            gh release delete "$tag" --yes --cleanup-tag || true
+          done
